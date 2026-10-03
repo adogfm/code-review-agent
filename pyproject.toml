@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=70"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "python-code-review-agent"
+version = "0.1.0"
+description = "A minimal Python code review agent with deterministic local tools and optional OpenAI review."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "openai>=2.26.0,<3.0.0",
+    "pydantic>=2.12.0,<3.0.0",
+    "python-dotenv>=1.2.0,<2.0.0",
+]
+
+[project.scripts]
+code-review-agent = "main:main"
+code-review-benchmark = "benchmarks.run:main"
+
+[tool.setuptools]
+py-modules = [
+    "agent",
+    "code_checker",
+    "file_editor",
+    "llm",
+    "main",
+    "models",
+    "planner",
+    "prompt",
+]
+packages = ["benchmarks"]
