@@ -66,7 +66,7 @@ def main() -> int:
 
         reviewer = create_reviewer()
         if reviewer.is_mock:
-            print("[MOCK MODE] 未检测到有效 OPENAI_API_KEY，使用本地固定审查结果。")
+            print("[MOCK MODE] 未检测到有效 DASHSCOPE_API_KEY，使用本地固定审查结果。")
 
         agent = CodeReviewAgent(reviewer)
         if arguments.apply_fixes:

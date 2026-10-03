@@ -2,14 +2,14 @@
 
 一个可离线运行、可扩展的 Python 代码审查 Agent。它通过 Task Planner 决定是否调用本地 AST 工具，整理静态检查和 Reviewer 结果，并可生成安全补丁、修改文件后自动复检。
 
-项目默认使用 `[MOCK MODE]`，不需要 API Key，也不会访问网络。配置 `OPENAI_API_KEY` 后会自动切换到真实 LLM Reviewer。
+项目默认使用 `[MOCK MODE]`，不需要 API Key，也不会访问网络。配置 `DASHSCOPE_API_KEY` 后会自动切换到通义千问 OpenAI 兼容 Reviewer。
 
 ## 功能
 
 - Task Planner 根据任务意图决定是否调用 `CodeChecker`。
 - `CodeChecker` 使用 Python AST 检查语法错误、裸 `except` 和常量除零。
 - Mock Reviewer 提供固定结构化结果，支持完全离线开发和测试。
-- OpenAI Reviewer 使用结构化输出补充正确性、安全性、性能和可维护性问题。
+- 通义千问 Reviewer 使用 OpenAI 兼容 `chat.completions` 与 JSON 输出补充正确性、安全性、性能和可维护性问题。
 - `FileEditor` 根据已确认的审查结果生成 unified diff，并应用保守的自动修复。
 - 修改后自动重新运行 `CodeChecker`，报告剩余问题。
 - 包含 7 个确定性 Benchmark 示例任务和 GitHub Actions CI 配置。
@@ -24,7 +24,7 @@ flowchart TD
     Planner -->|跳过| Reviewer
     Checker --> Reviewer[Reviewer Interface]
     Factory[create_reviewer] --> Mock[MockReviewer]
-    Factory --> OpenAI[OpenAIReviewer]
+    Factory --> OpenAI[OpenAIReviewer / Qwen Chat Completions]
     Mock --> Reviewer
     OpenAI --> Reviewer
     Reviewer --> Report[ReviewReport]
@@ -45,7 +45,7 @@ flowchart TD
 | `planner.py` | 根据任务意图生成 `ReviewPlan` |
 | `code_checker.py` | 不执行代码的 AST 静态检查 Tool |
 | `file_editor.py` | 从结构化审查结果生成并安全应用补丁 |
-| `llm.py` | Reviewer 协议、Mock/OpenAI 实现及模式选择 |
+| `llm.py` | Reviewer 协议、Mock/通义千问 OpenAI 兼容实现、JSON 校验及模式选择 |
 | `prompt.py` | 真实 LLM 的系统提示和审查上下文 |
 | `models.py` | 严重程度、问题和审查报告模型 |
 | `benchmarks/` | Benchmark 案例、执行器和退出码 |
@@ -54,7 +54,7 @@ flowchart TD
 ## 环境要求
 
 - Python 3.10 或更高版本
-- OpenAI API Key（可选）
+- 阿里云百炼 API Key（可选）
 
 ## 快速开始
 
@@ -79,11 +79,16 @@ python3 -m venv .venv
 无需修改 `.env` 即可使用 Mock 模式。如需真实 LLM 审查：
 
 ```dotenv
-OPENAI_API_KEY=sk-your-real-key
-OPENAI_MODEL=gpt-4o-mini
+DASHSCOPE_API_KEY=sk-your-real-key
+DASHSCOPE_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+QWEN_MODEL=qwen-plus
 ```
 
 `.env` 已加入 `.gitignore`，不要提交真实密钥。
+
+推荐按阿里云百炼工作空间所在地域设置专属 `DASHSCOPE_BASE_URL`；上例的旧版中国内地兼容地址仍可使用。为兼容旧配置，程序也会回退读取 `OPENAI_API_KEY`、`OPENAI_BASE_URL` 和 `OPENAI_MODEL`。配置优先级为 `DASHSCOPE_* / QWEN_MODEL` 高于对应的 `OPENAI_*` 变量。
+
+真实模式调用 `client.chat.completions.create()`，要求千问输出 JSON Object，并将 `choices[0].message.content` 严格校验为 Pydantic `ReviewReport`。解析器也兼容模型偶发返回的 JSON Markdown 代码围栏，但字段缺失、严重程度非法、空响应或截断响应仍会明确报错。
 
 如果已经激活虚拟环境，也可以直接使用命令名：
 
@@ -195,12 +200,12 @@ python -m unittest discover -s tests -v
 .\.venv\Scripts\code-review-agent.exe --help
 ```
 
-2026-09-26 本地验证结果：
+2026-10-03 本地验证结果：
 
 | 检查 | 环境 | 结果 |
 | --- | --- | --- |
 | 源码编译 | Python 3.14.3 / Windows | 通过 |
-| 离线单元测试 | Python 3.14.3 / Windows | `19 tests OK` |
+| 离线单元测试 | Python 3.14.3 / Windows | `26 tests OK` |
 | CodeChecker Benchmark | Python 3.14.3 / Windows | `7/7 cases passed` |
 | `pip install -e .` | setuptools 84.0.0 | 通过 |
 | `code-review-agent --help` | 安装后的 CLI 入口 | 通过 |

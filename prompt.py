@@ -13,7 +13,10 @@ SYSTEM_PROMPT = """你是一名严谨的 Python 代码审查专家。
 每个问题必须包含：问题、严重程度、原因和可执行的修改建议。
 严重程度只能是 critical、high、medium、low。
 不要为了凑数而报告问题；若没有明确问题，返回空的问题列表并给出简短总结。
-使用中文输出。"""
+使用中文输出。
+必须只返回一个合法 JSON 对象，不要添加 Markdown、代码围栏或解释文字。
+JSON 格式必须严格为：
+{"summary": "整体结论", "issues": [{"problem": "问题", "severity": "critical|high|medium|low", "reason": "原因", "suggestion": "建议"}]}"""
 
 
 def build_review_input(

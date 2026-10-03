@@ -33,7 +33,7 @@ flowchart LR
 
     subgraph Reviewers[Reviewer 层]
         Factory[create_reviewer] -->|无 Key| Mock[MockReviewer]
-        Factory -->|有 Key| LLM[OpenAIReviewer]
+        Factory -->|有 Key| LLM[OpenAIReviewer / Qwen Chat Completions]
         Mock --> Reviewer[Reviewer Protocol]
         LLM --> Reviewer
     end
@@ -89,7 +89,7 @@ sequenceDiagram
 | `planner.py` | `TaskPlanner`, `ReviewPlan` | 将任务文本映射为透明、确定性的 Tool 调用决策 |
 | `code_checker.py` | `CodeChecker`, `CodeCheckFinding` | 仅使用 AST 的本地静态分析，不执行代码 |
 | `file_editor.py` | `FileEditor`, `GeneratedPatch`, `FileEditResult` | 白名单式生成 diff、检查文件新鲜度、应用补丁 |
-| `llm.py` | `Reviewer`, `MockReviewer`, `OpenAIReviewer` | 定义 Reviewer 边界并根据环境选择实现 |
+| `llm.py` | `Reviewer`, `MockReviewer`, `OpenAIReviewer`, `parse_review_report()` | 定义 Reviewer 边界，调用千问 OpenAI 兼容 Chat API，并将 JSON 校验为报告 |
 | `prompt.py` | `SYSTEM_PROMPT`, `build_review_input()` | 将任务、Plan、源码和 Tool 结果组织成 LLM 上下文 |
 | `models.py` | `ReviewIssue`, `ReviewReport` | 统一结构化输出和终端渲染 |
 | `benchmarks/` | `BENCHMARK_CASES`, `run_benchmark()` | 确定性回归任务及 CI 退出码 |
@@ -128,10 +128,12 @@ CodeChecker 调用 `ast.parse()`，当前规则：
 
 `create_reviewer()` 根据 `.env` 自动路由：
 
-- 缺少、为空或仍是占位 `OPENAI_API_KEY`：`MockReviewer`；
-- 有效配置：`OpenAIReviewer`。
+- 缺少、为空或仍是占位 `DASHSCOPE_API_KEY`/`OPENAI_API_KEY`：`MockReviewer`；
+- 有效配置：`OpenAIReviewer`，通过千问 OpenAI 兼容接口工作。
 
-Mock 返回固定结构化结果，用于验证整个 Agent 流程。OpenAI Reviewer 使用 Pydantic `ReviewReport` 约束结构化输出。Agent 始终直接合并本地 Tool 发现，因此 LLM 不会成为确定性结果的单点故障。
+配置优先读取 `DASHSCOPE_API_KEY`、`DASHSCOPE_BASE_URL`、`QWEN_MODEL`，并兼容旧的 `OPENAI_API_KEY`、`OPENAI_BASE_URL`、`OPENAI_MODEL`。默认模型为 `qwen-plus`，默认地址为 `https://dashscope.aliyuncs.com/compatible-mode/v1`；生产环境可换成与 API Key 地域一致的工作空间专属地址。
+
+Mock 返回固定结构化结果，用于验证整个 Agent 流程。真实 Reviewer 调用 `chat.completions.create()`，设置 `response_format={"type": "json_object"}` 和非思考模式，然后读取 `choices[0].message.content`。`parse_review_report()` 先解析纯 JSON 或 JSON 代码围栏，再使用 Pydantic 严格校验 `ReviewReport`；空响应、截断、拒答、非法 JSON 和 schema 错误均转换为 `LLMReviewError`。Agent 始终直接合并本地 Tool 发现，因此 LLM 不会成为确定性结果的单点故障。
 
 ## 8. FileEditor 安全模型
 
@@ -177,16 +179,17 @@ Runner 对实际和预期序列做精确比较，打印每个任务的 PASS/FAIL
 
 测试均可离线执行，覆盖：
 
-- Mock/OpenAI Reviewer 路由；
+- Mock/千问 OpenAI 兼容 Reviewer 路由；
+- Chat Completions 参数、纯 JSON、代码围栏 JSON、非法 JSON、schema 错误和截断响应；
 - Planner 调用、跳过、混合和模糊意图；
 - AST 语法、裸 `except`、三种零除及误报基线；
 - Agent 的 Tool 传递和报告合并；
 - FileEditor diff、实际写入、复检、危险修复跳过和过期补丁保护；
 - Benchmark 案例数量与所有预期。
 
-2026-09-26 在 Python 3.14.3 / Windows 上：
+2026-10-03 在 Python 3.14.3 / Windows 上：
 
-- `python -m unittest discover -s tests -v`：19 tests OK；
+- `python -m unittest discover -s tests -v`：26 tests OK；
 - `python -m benchmarks.run`：7/7 cases passed；
 - `python -m compileall -q .`：通过；
 - 可编辑安装和两个 console scripts：通过。

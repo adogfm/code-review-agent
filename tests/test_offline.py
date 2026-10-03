@@ -1,17 +1,24 @@
-"""Offline tests that never call the OpenAI API."""
+"""Offline tests that never call a remote LLM API."""
 
 from __future__ import annotations
 
 import os
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 from uuid import uuid4
 
 from agent import CodeReviewAgent
 from code_checker import CodeCheckFinding, CodeChecker
 from file_editor import FileEditError, FileEditor
-from llm import MockReviewer, OpenAIReviewer, create_reviewer
+from llm import (
+    LLMReviewError,
+    MockReviewer,
+    OpenAIReviewer,
+    create_reviewer,
+    parse_review_report,
+)
 from models import ReviewReport
 from planner import ReviewPlan, TaskPlanner
 
@@ -60,13 +67,108 @@ class OfflineReviewerTests(unittest.TestCase):
     def test_api_key_keeps_real_reviewer_available(self) -> None:
         with patch("llm.load_dotenv"), patch.dict(
             os.environ,
-            {"OPENAI_API_KEY": "test-api-key", "OPENAI_MODEL": "gpt-4o-mini"},
+            {
+                "DASHSCOPE_API_KEY": "test-api-key",
+                "DASHSCOPE_BASE_URL": "https://example.com/compatible-mode/v1",
+                "QWEN_MODEL": "qwen-test",
+            },
             clear=True,
         ):
             reviewer = create_reviewer()
 
         self.assertIsInstance(reviewer, OpenAIReviewer)
         self.assertFalse(reviewer.is_mock)
+        self.assertEqual(reviewer._model, "qwen-test")
+        self.assertEqual(reviewer._base_url, "https://example.com/compatible-mode/v1")
+
+    def test_legacy_openai_api_key_remains_supported(self) -> None:
+        with patch("llm.load_dotenv"), patch.dict(
+            os.environ,
+            {"OPENAI_API_KEY": "legacy-test-key", "OPENAI_MODEL": "qwen-plus"},
+            clear=True,
+        ):
+            reviewer = create_reviewer()
+
+        self.assertIsInstance(reviewer, OpenAIReviewer)
+        self.assertEqual(reviewer._model, "qwen-plus")
+
+
+class ChatCompletionReviewerTests(unittest.TestCase):
+    valid_json = (
+        '{"summary":"审查完成","issues":['
+        '{"problem":"示例问题","severity":"low",'
+        '"reason":"示例原因","suggestion":"示例建议"}]}'
+    )
+
+    def test_parse_valid_json_as_review_report(self) -> None:
+        report = parse_review_report(self.valid_json)
+
+        self.assertEqual(report.summary, "审查完成")
+        self.assertEqual(report.issues[0].severity, "low")
+
+    def test_parse_json_inside_markdown_fence(self) -> None:
+        report = parse_review_report(f"```json\n{self.valid_json}\n```")
+
+        self.assertEqual(report.issues[0].problem, "示例问题")
+
+    def test_invalid_json_raises_review_error(self) -> None:
+        with self.assertRaisesRegex(LLMReviewError, "JSON"):
+            parse_review_report("not-json")
+
+    def test_wrong_json_schema_raises_review_error(self) -> None:
+        with self.assertRaisesRegex(LLMReviewError, "ReviewReport"):
+            parse_review_report('{"message":"missing required fields"}')
+
+    def test_review_uses_chat_completions_and_parses_content(self) -> None:
+        fake_client = Mock()
+        fake_client.chat.completions.create.return_value = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    finish_reason="stop",
+                    message=SimpleNamespace(content=self.valid_json, refusal=None),
+                )
+            ]
+        )
+        reviewer = OpenAIReviewer(
+            api_key="test-api-key",
+            base_url="https://example.com/compatible-mode/v1",
+            model="qwen-test",
+            client=fake_client,
+        )
+
+        report = reviewer.review(
+            "print('hello')",
+            [],
+            task="全面审查",
+            plan=ReviewPlan(use_code_checker=True, reason="测试"),
+        )
+
+        self.assertEqual(report.summary, "审查完成")
+        request = fake_client.chat.completions.create.call_args.kwargs
+        self.assertEqual(request["model"], "qwen-test")
+        self.assertEqual(request["response_format"], {"type": "json_object"})
+        self.assertEqual(request["extra_body"], {"enable_thinking": False})
+        self.assertEqual(request["messages"][0]["role"], "system")
+
+    def test_truncated_chat_completion_raises_review_error(self) -> None:
+        fake_client = Mock()
+        fake_client.chat.completions.create.return_value = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    finish_reason="length",
+                    message=SimpleNamespace(content=self.valid_json, refusal=None),
+                )
+            ]
+        )
+        reviewer = OpenAIReviewer(api_key="test-api-key", client=fake_client)
+
+        with self.assertRaisesRegex(LLMReviewError, "截断"):
+            reviewer.review(
+                "print('hello')",
+                [],
+                task="全面审查",
+                plan=ReviewPlan(use_code_checker=True, reason="测试"),
+            )
 
 
 class CodeCheckerTests(unittest.TestCase):

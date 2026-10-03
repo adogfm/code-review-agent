@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "python-code-review-agent"
 version = "0.1.0"
-description = "A minimal Python code review agent with deterministic local tools and optional OpenAI review."
+description = "A Python code review agent with local tools and optional Qwen review through an OpenAI-compatible API."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
