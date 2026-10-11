@@ -1,262 +1,369 @@
-# Python Code Review Agent
+# Homework1：Multi-Agent Code Review Workflow
 
-一个可离线运行、可扩展的 Python 代码审查 Agent。它通过 Task Planner 决定是否调用本地 AST 工具，整理静态检查和 Reviewer 结果，并可生成安全补丁、修改文件后自动复检。
+一个面向 Python 的多 Agent 代码生成、审查、测试与自动修复项目。项目以统一的 Agent 接口和可观测的 `WorkflowState` 为核心，将 Coding、Review、Test、Fix 串成带条件分支和有限循环的完整闭环，并生成可序列化的最终报告。
 
-项目默认使用 `[MOCK MODE]`，不需要 API Key，也不会访问网络。配置 `DASHSCOPE_API_KEY` 后会自动切换到通义千问 OpenAI 兼容 Reviewer。
+项目既可完全离线运行，也可通过 OpenAI 兼容接口接入 Qwen。根目录的 `demo.py` 提供无需 API Key、结果可复现的端到端演示。
 
-## 功能
+## 功能概览
 
-- Task Planner 根据任务意图决定是否调用 `CodeChecker`。
-- `CodeChecker` 使用 Python AST 检查语法错误、裸 `except` 和常量除零。
-- Mock Reviewer 提供固定结构化结果，支持完全离线开发和测试。
-- 通义千问 Reviewer 使用 OpenAI 兼容 `chat.completions` 与 JSON 输出补充正确性、安全性、性能和可维护性问题。
-- `FileEditor` 根据已确认的审查结果生成 unified diff，并应用保守的自动修复。
-- 修改后自动重新运行 `CodeChecker`，报告剩余问题。
-- 包含 7 个确定性 Benchmark 示例任务和 GitHub Actions CI 配置。
+- **统一 Agent 抽象**：`CodingAgent`、`ReviewAgent`、`TestAgent`、`FixAgent` 均继承 `BaseAgent`。
+- **状态驱动执行**：Agent 只读取 `StateView` 并返回 `AgentResult`，由 Workflow 原子提交状态更新。
+- **条件分支与有限循环**：根据 Review 和 Test 结果决定结束、测试、修复或继续复验。
+- **真实测试执行**：自动生成 `unittest` 用例，并在带超时的独立 Python 子进程中运行。
+- **完整可观测性**：保存阶段状态、Agent 结果、测试历史、修复历史、迭代次数和结构化日志。
+- **最终 Workflow Report**：汇总业务结果、阶段记录、测试结果、修复轮次和执行日志，并支持 JSON 序列化。
+- **离线与真实模型双模式**：无 Key 时使用确定性 Mock；配置 Key 后使用 Qwen OpenAI 兼容服务。
 
-## Agent 架构
+更详细的设计取舍见 [Design.md](Design.md)。
+
+## 系统架构
+
+```mermaid
+flowchart TB
+    CLI["CLI / demo.py / Python API"] --> Engine["WorkflowEngine"]
+    Engine <--> State["WorkflowState"]
+    Engine --> Agents["BaseAgent 统一接口"]
+
+    subgraph AgentLayer["Agent 层"]
+        Coding["CodingAgent"]
+        Review["ReviewAgent"]
+        Test["TestAgent"]
+        Fix["FixAgent"]
+    end
+
+    Agents --> Coding
+    Agents --> Review
+    Agents --> Test
+    Agents --> Fix
+
+    Coding --> Generator["CodeGenerator"]
+    Review --> Checker["TaskPlanner + CodeChecker + Reviewer"]
+    Test --> Runner["TestGenerator + TestRunner"]
+    Fix --> Fixer["CodeFixer"]
+
+    Generator --> Providers["Mock / Qwen Provider"]
+    Checker --> Providers
+    Runner --> Providers
+    Fixer --> Providers
+
+    State --> Report["Workflow Report"]
+```
+
+`WorkflowEngine` 负责调度、路由、状态提交和异常处理；Agent 负责单一领域任务；模型供应商通过协议与 Agent 解耦。本地 `CodeChecker` 和 `TestRunner` 不依赖远程模型。
+
+## Agent 闭环
+
+### 统一接口
+
+`BaseAgent` 使用模板方法统一校验输入输出：
+
+```python
+result = agent.execute(state_view)
+# result: AgentResult(updates={...}, output=...)
+```
+
+每个子类只需实现 `run(state)`。第三方 Agent 也可直接实现包含 `name` 和 `execute(StateView) -> AgentResult` 的结构化接口。
+
+| Agent | 核心职责 | 主要输入 | 主要输出 |
+| --- | --- | --- | --- |
+| `CodingAgent` | 根据需求生成并校验 Python 代码 | `requirements`、`context` | `code`、`generation_result` |
+| `ReviewAgent` | 合并任务规划、AST 检查、模型审查和测试证据 | `code`、`task`、测试结果 | `report`、`plan`、`tool_findings` |
+| `TestAgent` | 生成或复用测试，并执行真实子进程测试 | `code`、需求、原测试用例 | `test_cases`、`test_result` |
+| `FixAgent` | 根据 Review/Test 反馈修改代码并生成 diff | `code`、`report`、`test_result` | 新 `code`、`fix_result`、`fix_changed` |
+
+### 完整工作流程
 
 ```mermaid
 flowchart TD
-    CLI[CLI / main.py] --> Agent[CodeReviewAgent]
-    Agent --> Planner[TaskPlanner]
-    Planner -->|调用| Checker[CodeChecker / AST]
-    Planner -->|跳过| Reviewer
-    Checker --> Reviewer[Reviewer Interface]
-    Factory[create_reviewer] --> Mock[MockReviewer]
-    Factory --> OpenAI[OpenAIReviewer / Qwen Chat Completions]
-    Mock --> Reviewer
-    OpenAI --> Reviewer
-    Reviewer --> Report[ReviewReport]
-    Checker --> Report
-    Report -->|--apply-fixes| Editor[FileEditor]
-    Editor --> Patch[Unified Diff + 文件写入]
-    Patch --> Verify[CodeChecker 二次验证]
+    Input["需求 / 现有代码"] --> Coding["Coding"]
+    Coding --> BaselineReview["Review：基线审查"]
+    BaselineReview --> BaselineTest["Test：基线测试"]
+    BaselineTest --> Decision{"Review 无阻断问题<br/>且测试实际通过？"}
+
+    Decision -->|是| Success["resolved"]
+    Decision -->|否，且有修复预算| Fix["Fix：读取最新诊断"]
+    Decision -->|否，且预算耗尽| Unresolved["max_fix_attempts"]
+
+    Fix --> Changed{"代码发生变化？"}
+    Changed -->|否| NoChange["no_change"]
+    Changed -->|是| VerifyTest["Test：复用原测试"]
+    VerifyTest --> VerifyReview["Review：重新审查"]
+    VerifyReview --> Decision
+
+    Success --> Report["Workflow Report"]
+    Unresolved --> Report
+    NoChange --> Report
 ```
 
-详细设计、决策边界和扩展点见 [Design.md](Design.md)。
+闭环遵循以下规则：
 
-## 模块说明
+1. 先完成基线 Review 和 Test，避免只凭单一信号判断成功。
+2. 仅当 Review 没有阻断问题，且 Test 实际执行并通过时，结果才是 `resolved`。
+3. 代码变化后必须复用原测试用例重新测试，再重新 Review。
+4. Fix 没有产生变化时以 `no_change` 提前停止，避免无效循环。
+5. 达到 `max_fix_attempts` 后以 `unresolved` 正常结束；Agent 异常则标记为 `failed`。
+6. `max_steps` 提供通用执行上限，防止错误路由造成无限循环。
 
-| 模块 | 职责 |
+单轮模式同样支持 `coding → review → test → fix → verify`，但不会继续消耗新的修复轮次。
+
+## Workflow State 与报告
+
+`WorkflowState` 同时保存业务数据和运行元数据。Engine 每次只提交一个 Agent 返回的完整更新，并递增 State 版本；Agent 异常时不会提交未完成结果。
+
+| 分类 | 代表内容 |
 | --- | --- |
-| `main.py` | CLI 参数、代码输入、模式提示、输出与顶层异常处理 |
-| `agent.py` | 编排 Planner、Tools、Reviewer、报告合并和修复后验证 |
-| `planner.py` | 根据任务意图生成 `ReviewPlan` |
-| `code_checker.py` | 不执行代码的 AST 静态检查 Tool |
-| `file_editor.py` | 从结构化审查结果生成并安全应用补丁 |
-| `llm.py` | Reviewer 协议、Mock/通义千问 OpenAI 兼容实现、JSON 校验及模式选择 |
-| `prompt.py` | 真实 LLM 的系统提示和审查上下文 |
-| `models.py` | 严重程度、问题和审查报告模型 |
-| `benchmarks/` | Benchmark 案例、执行器和退出码 |
-| `tests/` | Mock、Planner、CodeChecker、FileEditor 和 Benchmark 离线测试 |
+| 阶段状态 | `pending`、`running`、`completed`、`failed`，以及每次调用的耗时和错误 |
+| Agent 结果 | Agent、阶段、迭代、修复轮次、输出和更新字段 |
+| 测试记录 | 全部 `TestExecutionResult` 及最新测试结果 |
+| 修复历史 | 修复前后代码、Review/Test 快照、diff、轮次状态和步骤耗时 |
+| 迭代信息 | Workflow 总阶段次数、当前修复次数、最大修复预算 |
+| 执行日志 | 有序事件、时间、级别、State 版本、阶段、Agent 和修复轮次 |
 
-## 环境要求
+循环阶段不会覆盖历史记录。基线日志使用修复轮次 `0`，实际修复从 `1` 开始，可通过 `state.logs_for_round(n)` 查询单轮日志。
 
-- Python 3.10 或更高版本
-- 阿里云百炼 API Key（可选）
+终态可通过 `run.report` 获得 `WorkflowReport`：
 
-## 快速开始
+- `outcome`：`succeeded`、`unresolved` 或 `failed`；
+- 各阶段的状态、执行次数、累计耗时和调用记录；
+- 全部 Agent 结果、测试结果、修复历史与执行日志；
+- 最终 Review/Test 结果、总迭代次数和修复轮数；
+- `to_dict()`：生成 JSON 兼容字典。
+
+若 Workflow 抛出 `WorkflowExecutionError`，仍可对异常中的终态 State 调用 `generate_workflow_report(state)` 生成失败报告。
+
+## Demo：完整闭环演示
+
+`demo.py` 使用现有 Workflow 和四个真实 Agent 类，只替换为确定性的离线供应商。场景故意经历两轮修复：
+
+```text
+错误减法 → 第一轮修复仍多加 1 → 第二轮修复正确 → 3/3 测试通过
+```
+
+Demo 会按清晰的 CLI 分区输出：
+
+1. Agent 执行过程与 State 更新字段；
+2. Review/Test 条件判断和下一节点；
+3. 每轮修复状态及各步骤耗时；
+4. 按轮次组织的结构化执行日志；
+5. 最终 Workflow Report 和最终代码。
+
+Windows PowerShell：
+
+```powershell
+.\.venv\Scripts\python.exe demo.py
+.\.venv\Scripts\python.exe demo.py --json
+```
+
+macOS / Linux：
+
+```bash
+.venv/bin/python demo.py
+.venv/bin/python demo.py --json
+```
+
+可用参数：
+
+| 参数 | 说明 |
+| --- | --- |
+| `--max-fix-attempts N` | 设置最大修复次数；默认 `3`，演示正常收敛需要 `2` 次 |
+| `--json` | 在人类可读结果后附加完整 Report JSON |
+
+退出码 `0` 表示成功，`1` 表示未解决或执行失败。可编辑安装后也可使用 `homework2-demo` 命令。
+
+## 安装与配置
+
+项目要求 Python 3.10 或更高版本。
 
 ### Windows PowerShell
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -e .
-.\.venv\Scripts\code-review-agent.exe --help
+.\.venv\Scripts\python.exe main.py --help
 ```
-
-这里直接使用虚拟环境内的 Python 和 CLI 路径，不依赖 PowerShell 激活脚本或当前 `PATH`。安装完成后会在 `.venv\Scripts` 中生成 `code-review-agent.exe` 和 `code-review-benchmark.exe`。
 
 ### macOS / Linux
 
 ```bash
 python3 -m venv .venv
 .venv/bin/python -m pip install -e .
-.venv/bin/code-review-agent --help
+.venv/bin/python main.py --help
 ```
 
-无需修改 `.env` 即可使用 Mock 模式。如需真实 LLM 审查：
+安装后提供以下命令：
+
+- `code-review-agent`
+- `code-review-benchmark`
+- `homework2-demo`
+
+### 模型配置
+
+不配置 API Key 时自动使用离线 Mock。接入 Qwen 时，在本地 `.env` 中设置：
 
 ```dotenv
-DASHSCOPE_API_KEY=sk-your-real-key
+DASHSCOPE_API_KEY=your_api_key_here
 DASHSCOPE_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 QWEN_MODEL=qwen-plus
 ```
 
-`.env` 已加入 `.gitignore`，不要提交真实密钥。
+项目也兼容 `OPENAI_API_KEY`、`OPENAI_BASE_URL` 和 `OPENAI_MODEL`。`.env` 不应提交到 Git；默认模板见 [.env.example](.env.example)。
 
-推荐按阿里云百炼工作空间所在地域设置专属 `DASHSCOPE_BASE_URL`；上例的旧版中国内地兼容地址仍可使用。为兼容旧配置，程序也会回退读取 `OPENAI_API_KEY`、`OPENAI_BASE_URL` 和 `OPENAI_MODEL`。配置优先级为 `DASHSCOPE_* / QWEN_MODEL` 高于对应的 `OPENAI_*` 变量。
+> **Mock 模式说明**：Mock 用于验证流程与接口，不保证实现任意业务需求。`MockTestGenerator` 只执行模块导入冒烟测试，`MockCodeFixer` 仅处理有限的安全改写。需要业务级结果时，应使用真实供应商或 `demo.py` 中的确定性场景。
 
-真实模式调用 `client.chat.completions.create()`，要求千问输出 JSON Object，并将 `choices[0].message.content` 严格校验为 Pydantic `ReviewReport`。解析器也兼容模型偶发返回的 JSON Markdown 代码围栏，但字段缺失、严重程度非法、空响应或截断响应仍会明确报错。
+## 使用方式
 
-如果已经激活虚拟环境，也可以直接使用命令名：
+以下示例使用 Windows 虚拟环境路径；macOS / Linux 将解释器替换为 `.venv/bin/python`。
 
-```powershell
-code-review-agent --help
-code-review-benchmark
-```
-
-Windows PowerShell 中若未激活虚拟环境，裸命令不会自动搜索当前项目的 `.venv\Scripts`；此时应优先使用 `.\.venv\Scripts\code-review-agent.exe` 的显式路径。
-
-## 运行示例
-
-### 1. 粘贴代码
+### 审查现有代码
 
 ```powershell
-python main.py
+.\.venv\Scripts\python.exe main.py example.py
+.\.venv\Scripts\python.exe main.py example.py --task "检查正确性和异常处理"
 ```
 
-粘贴代码后单独输入 `END`：
+省略文件路径时进入终端粘贴模式，以单独一行 `END` 结束输入。
 
-```text
-value = 10 / 0
-END
-```
-
-### 2. 审查 Python 文件
+使用 `--apply-fixes` 可对支持的本地问题应用保守修复，并在写入前检查文件是否已变化：
 
 ```powershell
-python main.py example.py
+.\.venv\Scripts\python.exe main.py example.py --apply-fixes
 ```
 
-### 3. 指定任务，让 Planner 自主路由
+### 生成、测试与修复
 
 ```powershell
-# 全面审查：调用 CodeChecker
-python main.py example.py --task "全面审查正确性和安全性"
+# 生成并审查
+.\.venv\Scripts\python.exe main.py --requirements "实现 add(a, b)，返回两数之和"
 
-# 仅风格和命名：跳过 CodeChecker
-python main.py example.py --task "只检查代码风格和命名"
+# 生成、审查并测试
+.\.venv\Scripts\python.exe main.py --requirements "实现 add(a, b)，返回两数之和" --run-tests
+
+# 单轮修复与复验
+.\.venv\Scripts\python.exe main.py --requirements "实现 add(a, b)，返回两数之和" --run-tests --fix-code
+
+# 最多自动修复 3 次
+.\.venv\Scripts\python.exe main.py --requirements "实现 add(a, b)，返回两数之和" --run-tests --fix-code --max-fix-attempts 3
 ```
 
-Planner 的当前规则：
+参数约束：
 
-- 全面审查，或涉及语法、错误、异常、安全、正确性、可靠性：调用 CodeChecker。
-- 仅解释、总结、风格、格式、命名、注释、文档或可读性：跳过 CodeChecker。
-- 同时包含风险和风格意图：优先调用 CodeChecker。
-- 意图不明确：默认调用低成本静态检查，减少漏检。
+- `--context` 必须与 `--requirements` 一起使用；
+- `--run-tests` 和 `--fix-code` 仅用于生成流程；
+- `--max-fix-attempts` 必须是非负整数，并与 `--run-tests --fix-code` 一起使用；
+- `--test-timeout` 设置测试子进程超时，默认 10 秒；
+- `--apply-fixes` 仅用于传入的 `.py` 文件。
 
-### 4. 生成并应用安全补丁
+主 CLI 的退出码为：成功 `0`，Workflow/模型失败或结果未通过 `1`，参数错误 `2`，用户中断 `130`。
+
+## Python API
+
+以下代码组装完整自动修复循环：
+
+```python
+from agent import ReviewAgent
+from coding_agent import CodingAgent, create_coding_workflow
+from fix_agent import FixAgent
+from llm import (
+    create_code_fixer,
+    create_code_generator,
+    create_reviewer,
+    create_test_generator,
+)
+from test_agent import TestAgent
+
+workflow = create_coding_workflow(
+    CodingAgent(create_code_generator()),
+    ReviewAgent(create_reviewer()),
+    test_agent=TestAgent(create_test_generator()),
+    fix_agent=FixAgent(create_code_fixer()),
+    max_fix_attempts=3,
+)
+
+run = workflow.run({
+    "requirements": "实现 add(a, b)，返回两数之和",
+    "context": "仅使用 Python 标准库",
+})
+
+print(run.state.require("code", str))
+print(run.report.summary)
+print(run.report.to_dict())
+```
+
+主要工厂函数：
+
+| 工厂 | 用途 |
+| --- | --- |
+| `create_review_workflow(...)` | 审查 State 中的现有代码 |
+| `create_coding_workflow(...)` | 组合代码生成及可选 Review/Test/Fix 节点 |
+| `create_test_workflow(...)` | 测试 State 中的现有代码 |
+| `create_fix_workflow(...)` | 对已有诊断执行单次修复 |
+| `create_repair_workflow(...)` | 对已有代码运行有限自动修复循环 |
+
+## 测试与验证
+
+本地离线回归结果：
+
+| 检查项 | 结果 |
+| --- | --- |
+| 单元测试 | `145 tests OK` |
+| CodeChecker Benchmark | `7/7 cases passed` |
+| Python 源码编译 | 通过 |
+| Demo 完整闭环 | 两轮修复后 `3/3` 测试通过，Report 为 `succeeded` |
+
+复现命令：
 
 ```powershell
-python main.py example.py --apply-fixes
-```
-
-示例输出片段：
-
-```diff
---- example.py
-+++ example.py
-@@
--except:
-+except Exception:
-```
-
-只有显式提供 `--apply-fixes` 才会写入文件。当前自动修复范围是裸 `except`；语法错误和除零问题会说明无法安全自动修复的原因，不会擅自改写业务逻辑。写入前会检查文件是否在审查后发生变化，修改后会自动重新运行 CodeChecker。
-
-## CodeChecker 规则
-
-| Rule ID | 检查内容 | 严重程度 | 自动修复 |
-| --- | --- | --- | --- |
-| `syntax-error` | Python AST 无法解析 | high | 否，需要理解代码意图 |
-| `bare-except` | `except:` 捕获范围过宽 | medium | 是，改为 `except Exception:` |
-| `division-by-zero` | `/ 0`、`// 0`、`% 0`，含正负零常量 | high | 否，避免改变业务语义 |
-
-## Benchmark 示例任务
-
-运行：
-
-```powershell
-python -m benchmarks.run
-```
-
-| Case | 示例问题 | 预期规则 |
-| --- | --- | --- |
-| `syntax_error` | 函数定义语法错误 | `syntax-error` |
-| `bare_except` | 裸 `except` | `bare-except` |
-| `true_division_zero` | `/ 0` | `division-by-zero` |
-| `floor_division_zero` | `// -0.0` | `division-by-zero` |
-| `modulo_zero` | `% +0` | `division-by-zero` |
-| `multiple_findings` | 同时包含零除和裸 `except` | 两条对应规则 |
-| `clean_baseline` | 合法异常处理和动态分母检查 | 无问题 |
-
-Benchmark 是确定性本地评测，不调用 LLM。任何预期与实际不一致都会返回非零退出码，适合 CI 使用。
-
-## 测试与验证结果
-
-离线测试：
-
-```powershell
-python -m unittest discover -s tests -v
-```
-
-完整本地验证命令：
-
-```powershell
-.\.venv\Scripts\python.exe -m compileall -q .
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 .\.venv\Scripts\python.exe -m benchmarks.run
-.\.venv\Scripts\code-review-agent.exe --help
+.\.venv\Scripts\python.exe -m compileall -q agent.py coding_agent.py demo.py fix_agent.py llm.py main.py models.py planner.py prompt.py review_policy.py test_agent.py test_feedback.py test_worker.py workflow tests
+.\.venv\Scripts\python.exe demo.py
 ```
 
-2026-10-03 本地验证结果：
-
-| 检查 | 环境 | 结果 |
-| --- | --- | --- |
-| 源码编译 | Python 3.14.3 / Windows | 通过 |
-| 离线单元测试 | Python 3.14.3 / Windows | `26 tests OK` |
-| CodeChecker Benchmark | Python 3.14.3 / Windows | `7/7 cases passed` |
-| `pip install -e .` | setuptools 84.0.0 | 通过 |
-| `code-review-agent --help` | 安装后的 CLI 入口 | 通过 |
-| `code-review-benchmark` | 安装后的 Benchmark 入口 | `7/7 cases passed` |
-
-GitHub Actions 已配置在 `.github/workflows/ci.yml`：Linux 会在 Python 3.10 和 3.12 上执行编译、测试和 Benchmark，Windows 会在独立虚拟环境中安装项目，并分别通过虚拟环境路径和 `PATH` 调用 CLI 入口。远程 CI 状态需在首次 push 后确认。
+测试覆盖 Agent 输入输出、State 版本与快照、条件路由、循环上限、测试子进程、失败证据、修复语法重试、Review 范围策略、Workflow Report 和 CLI 行为。GitHub Actions 配置位于 [.github/workflows/ci.yml](.github/workflows/ci.yml)。
 
 ## 项目结构
 
 ```text
 .
-├── .github/workflows/ci.yml
-├── benchmarks/
-│   ├── __init__.py
-│   ├── cases.py
-│   └── run.py
-├── tests/
-│   ├── test_benchmark.py
-│   └── test_offline.py
-├── agent.py
-├── code_checker.py
-├── file_editor.py
-├── llm.py
-├── main.py
-├── models.py
-├── planner.py
-├── prompt.py
-├── Design.md
-├── pyproject.toml
-├── requirements.txt
-├── .env.example
-└── README.md
+├── workflow/
+│   ├── agent.py             # Agent Protocol、BaseAgent、AgentResult
+│   ├── engine.py            # Workflow 步骤、路由和执行器
+│   ├── state.py             # State、阶段记录和执行日志
+│   ├── repair.py            # 条件分支和有限修复循环
+│   └── report.py            # 最终 Workflow Report
+├── tests/                   # 145 项离线回归测试
+├── benchmarks/              # 7 个确定性 CodeChecker 案例
+├── agent.py                 # ReviewAgent
+├── coding_agent.py          # CodingAgent 与组合工厂
+├── test_agent.py            # TestAgent 与 TestRunner
+├── fix_agent.py             # FixAgent 与 FixRun
+├── llm.py                   # Provider 协议、Mock 与 Qwen 实现
+├── models.py                # Pydantic 业务模型
+├── code_checker.py          # AST 静态检查
+├── review_policy.py         # Review 范围与评分策略
+├── test_feedback.py         # 测试失败证据提取
+├── main.py                  # 主 CLI
+├── demo.py                  # 确定性完整闭环演示
+├── Design.md                # 详细设计文档
+└── pyproject.toml           # 依赖、打包与命令入口
 ```
 
-## GitHub 提交前检查
+## 工程边界与安全说明
 
-```powershell
-.\.venv\Scripts\python.exe -m unittest discover -s tests -v
-.\.venv\Scripts\python.exe -m benchmarks.run
-git status
-git add .
-git commit -m "feat: add Python code review agent"
-```
+- 当前 Workflow 处理单份 Python 源码，不生成多文件工程。
+- `CodeChecker` 只覆盖少量高确定性 AST 规则，不能替代完整静态分析与人工审查。
+- `TestRunner` 使用临时目录、精简环境、独立进程和超时，但不是操作系统安全沙箱；不要执行不可信代码。
+- Test Agent 不自动安装第三方依赖，被测代码所需依赖必须已存在。
+- 真实模型模式会将需求、代码和诊断发送到配置的服务，请遵守相应的数据处理要求。
+- 自动循环保证次数有界，但不保证所有问题都能自动修复。
+- State 与日志当前保存在进程内，不支持持久化恢复或分布式执行。
 
-当前目录尚未初始化 Git 仓库。如需新建仓库，请先运行 `git init`，再执行上述提交命令。提交前确认 `.env`、`.venv`、缓存和构建产物未被跟踪。
+## Homework1 提交检查
 
-## 安全与限制
-
-- CodeChecker 只解析 AST，不执行用户代码。
-- Mock 模式不会访问网络。
-- 真实 LLM 模式会将代码发送到配置的 API 服务，不要提交密钥、个人信息或敏感代码。
-- Planner 是透明的关键词路由器，不是通用任务规划模型。
-- CodeChecker 仅覆盖少量高确定性规则，不替代 Ruff、Pylint、Bandit、mypy 或人工审查。
-- FileEditor 只应用白名单式修复；其余问题保留给开发者判断。
+- [x] 四个 Agent 统一继承 `BaseAgent`
+- [x] Workflow 支持条件分支和有限循环
+- [x] State 保存阶段、Agent、测试、修复、迭代和日志信息
+- [x] 最终 Workflow Report 支持结构化输出与 JSON 序列化
+- [x] `demo.py` 可离线展示完整闭环
+- [x] 145 项测试全部通过
+- [x] Benchmark 7/7 通过
